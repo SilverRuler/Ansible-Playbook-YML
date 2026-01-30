@@ -1,0 +1,130 @@
+---
+- name: OpenVPN 클라이언트 설정 및 .ovpn 파일 생성
+  hosts: gcp_nodes
+  become: true
+  vars:
+    client_config_dir: "{{ ansible_env.HOME }}/client-configs"
+    client_name: "tongchun"
+
+  tasks:
+    - name: 1. 클라이언트 파일을 모을 폴더 생성
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0700'
+      loop:
+        - "{{ client_config_dir }}/files"
+        - "{{ client_config_dir }}/keys"
+
+    - name: 2. 샘플 client.conf 파일을 base.conf로 복사
+      copy:
+        src: /usr/share/doc/openvpn/examples/sample-config-files/client.conf
+        dest: "{{ client_config_dir }}/base.conf"
+        remote_src: yes
+        force: no
+
+    - name: 3. GCP 외부 IP 주소 확인
+      shell: curl -s ifconfig.me
+      register: external_ip
+      changed_when: false
+
+    - name: 3-1. base.conf의 remote 설정을 외부 IP로 변경
+      replace:
+        path: "{{ client_config_dir }}/base.conf"
+        regexp: '^remote my-server-1 1194'
+        replace: "remote {{ external_ip.stdout }} 3300"
+
+    - name: 4. 프로토콜을 tcp로 변경
+      block:
+        - replace:
+            path: "{{ client_config_dir }}/base.conf"
+            regexp: '^;proto tcp'
+            replace: 'proto tcp'
+        - replace:
+            path: "{{ client_config_dir }}/base.conf"
+            regexp: '^proto udp'
+            replace: ';proto udp'
+
+    - name: 5. user nobody / group nogroup 주석 제거
+      block:
+        - replace:
+            path: "{{ client_config_dir }}/base.conf"
+            regexp: '^;user nobody'
+            replace: 'user nobody'
+        - replace:
+            path: "{{ client_config_dir }}/base.conf"
+            regexp: '^;group nobody'
+            replace: 'group nogroup'
+
+    - name: 6. SSL/TLS 인증서 설정 주석 처리
+      replace:
+        path: "{{ client_config_dir }}/base.conf"
+        regexp: '^(ca ca.crt|cert client.crt|key client.key)'
+        replace: '#\1'
+
+    - name: 7. Cipher(AES-256-CBC) 확인 및 auth SHA256 추가
+      replace:
+        path: "{{ client_config_dir }}/base.conf"
+        regexp: '^cipher AES-256-CBC'
+        replace: "cipher AES-256-CBC\nauth SHA256"
+
+    - name: 8. key-direction 1 추가
+      lineinfile:
+        path: "{{ client_config_dir }}/base.conf"
+        insertafter: '^auth SHA256'
+        line: 'key-direction 1'
+
+    - name: 9. 리눅스용 스크립트 보안 설정 주석으로 추가
+      lineinfile:
+        path: "{{ client_config_dir }}/base.conf"
+        line: "{{ item }}"
+      loop:
+        - "# script-security 2"
+        - "# up /etc/openvpn/update-resolv-conf"
+        - "# down /etc/openvpn/update-resolv-conf"
+
+    - name: 10-11. make_config.sh 스크립트 생성
+      copy:
+        dest: "{{ client_config_dir }}/make_config.sh"
+        content: |
+          #!/bin/bash
+          # First argument: Client identifier
+          KEY_DIR=~/client-configs/keys
+          OUTPUT_DIR=~/client-configs/files
+          BASE_CONFIG=~/client-configs/base.conf
+          cat ${BASE_CONFIG} \
+              <(echo -e '<ca>') \
+              ${KEY_DIR}/ca.crt \
+              <(echo -e '</ca>\n<cert>') \
+              ${KEY_DIR}/${1}.crt \
+              <(echo -e '</cert>\n<key>') \
+              ${KEY_DIR}/${1}.key \
+              <(echo -e '</key>\n<tls-auth>') \
+              ${KEY_DIR}/ta.key \
+              <(echo -e '</tls-auth>') \
+              > ${OUTPUT_DIR}/${1}.ovpn
+        mode: '0700'
+
+    - name: 13. make_config.sh 실행하여 tongchun.ovpn 생성
+      shell: "./make_config.sh {{ client_name }}"
+      args:
+        chdir: "{{ client_config_dir }}"
+        executable: /bin/bash
+        creates: "{{ client_config_dir }}/files/{{ client_name }}.ovpn"
+
+    - name: 14. tongchun.ovpn 생성 확인
+      stat:
+        path: "{{ client_config_dir }}/files/{{ client_name }}.ovpn"
+      register: ovpn_file
+
+    - name: 14-1. 파일 생성 결과 출력
+      debug:
+        msg: "파일 생성 완료: {{ ovpn_file.stat.path }}"
+      when: ovpn_file.stat.exists
+
+    - name: 15. ta.key 파일 복사 및 권한 설정
+      copy:
+        src: "{{ client_config_dir }}/keys/ta.key"
+        dest: "{{ client_config_dir }}/files/ta.key"
+        remote_src: yes
+        mode: '0644'
