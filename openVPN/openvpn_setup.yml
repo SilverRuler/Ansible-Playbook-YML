@@ -1,0 +1,180 @@
+---
+- name: OpenVPN 및 Easy-RSA 전체 환경 구축 및 서비스 가동
+  hosts: gcp_nodes
+  become: true
+  vars:
+    easyrsa_version: "3.0.4"
+    easyrsa_dir: "{{ ansible_env.HOME }}/EasyRSA-{{ easyrsa_version }}"
+    easyrsa_url: "https://github.com/OpenVPN/easy-rsa/releases/download/v{{ easyrsa_version }}/EasyRSA-{{ easyrsa_version }}.tgz"
+    ovpn_dir: "/etc/openvpn"
+
+  tasks:
+    - name: 1. apt 업데이트 및 openvpn 설치
+      apt:
+        name: openvpn
+        update_cache: yes
+        state: present
+
+    - name: 2. Easy-RSA 다운로드 및 압축 해제
+      unarchive:
+        src: "{{ easyrsa_url }}"
+        dest: "{{ ansible_env.HOME }}"
+        remote_src: yes
+        creates: "{{ easyrsa_dir }}"
+
+    - name: 3. Easy-RSA 설정 파일(vars) 정보 수정
+      block:
+        - name: vars.example 파일을 vars로 복사
+          copy:
+            src: "{{ easyrsa_dir }}/vars.example"
+            dest: "{{ easyrsa_dir }}/vars"
+            remote_src: yes
+            force: no
+        - name: vars 파일 내 지역 및 조직 정보 수정
+          lineinfile:
+            path: "{{ easyrsa_dir }}/vars"
+            regexp: '^#?set_var {{ item.key }}'
+            line: 'set_var {{ item.key }}    "{{ item.value }}"'
+          loop:
+            - { key: 'EASYRSA_REQ_COUNTRY', value: 'KR' }
+            - { key: 'EASYRSA_REQ_PROVINCE', value: 'Gyeonggi-do' }
+            - { key: 'EASYRSA_REQ_CITY', value: 'Seongnam' }
+            - { key: 'EASYRSA_REQ_ORG', value: 'nSR' }
+            - { key: 'EASYRSA_REQ_EMAIL', value: 'SR@sr.co.kr' }
+            - { key: 'EASYRSA_REQ_OU', value: 'SR' }
+
+    - name: 4-6. PKI 초기화 및 CA/서버 인증서 생성
+      block:
+        - command: "./easyrsa init-pki"
+          args: { chdir: "{{ easyrsa_dir }}", creates: "{{ easyrsa_dir }}/pki" }
+        - command: "./easyrsa build-ca nopass"
+          args: { chdir: "{{ easyrsa_dir }}", creates: "{{ easyrsa_dir }}/pki/ca.crt" }
+          environment: { EASYRSA_BATCH: "1", EASYRSA_REQ_CN: "OpenVPN-CA" }
+        - command: "./easyrsa gen-req server nopass"
+          args: { chdir: "{{ easyrsa_dir }}", creates: "{{ easyrsa_dir }}/pki/private/server.key" }
+          environment: { EASYRSA_BATCH: "1", EASYRSA_REQ_CN: "vpn-server" }
+
+    - name: 8-12. 서버 인증서 사인 및 DH, ta.key 생성/복사
+      block:
+        - command: "./easyrsa sign-req server server"
+          args: { chdir: "{{ easyrsa_dir }}", creates: "{{ easyrsa_dir }}/pki/issued/server.crt" }
+          environment: { EASYRSA_BATCH: "1" }
+        - copy:
+            src: "{{ item.src }}"
+            dest: "{{ item.dest }}"
+            remote_src: yes
+          loop:
+            - { src: "{{ easyrsa_dir }}/pki/issued/server.crt", dest: "{{ ovpn_dir }}/server.crt" }
+            - { src: "{{ easyrsa_dir }}/pki/ca.crt", dest: "{{ ovpn_dir }}/ca.crt" }
+            - { src: "{{ easyrsa_dir }}/pki/private/server.key", dest: "{{ ovpn_dir }}/server.key" }
+        - command: "./easyrsa gen-dh"
+          args: { chdir: "{{ easyrsa_dir }}", creates: "{{ easyrsa_dir }}/pki/dh.pem" }
+          environment: { EASYRSA_BATCH: "1" }
+        - copy: { src: "{{ easyrsa_dir }}/pki/dh.pem", dest: "{{ ovpn_dir }}/dh.pem", remote_src: yes }
+        - command: "openvpn --genkey --secret {{ ovpn_dir }}/ta.key"
+          args: { creates: "{{ ovpn_dir }}/ta.key" }
+
+    - name: 15-20. 클라이언트(tongchun) 인증서 생성 및 정리
+      block:
+        - file: { path: "{{ ansible_env.HOME }}/client-configs/keys", state: directory, mode: '0700' }
+        - command: "./easyrsa gen-req tongchun nopass"
+          args: { chdir: "{{ easyrsa_dir }}", creates: "{{ easyrsa_dir }}/pki/private/tongchun.key" }
+          environment: { EASYRSA_BATCH: "1", EASYRSA_REQ_CN: "tongchun" }
+        - command: "./easyrsa sign-req client tongchun"
+          args: { chdir: "{{ easyrsa_dir }}", creates: "{{ easyrsa_dir }}/pki/issued/tongchun.crt" }
+          environment: { EASYRSA_BATCH: "1" }
+        - copy:
+            src: "{{ item.src }}"
+            dest: "{{ item.dest }}"
+            remote_src: yes
+          loop:
+            - { src: "{{ easyrsa_dir }}/pki/private/tongchun.key", dest: "{{ ansible_env.HOME }}/client-configs/keys/tongchun.key" }
+            - { src: "{{ easyrsa_dir }}/pki/issued/tongchun.crt", dest: "{{ ansible_env.HOME }}/client-configs/keys/tongchun.crt" }
+            - { src: "{{ ovpn_dir }}/ca.crt", dest: "{{ ansible_env.HOME }}/client-configs/keys/ca.crt" }
+            - { src: "{{ ovpn_dir }}/ta.key", dest: "{{ ansible_env.HOME }}/client-configs/keys/ta.key" }
+
+    - name: 21. server.conf 설정 적용 (Redirect Gateway 포함)
+      block:
+        - copy: { src: /usr/share/doc/openvpn/examples/sample-config-files/server.conf, dest: /etc/openvpn/server.conf, remote_src: yes, force: yes }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^dh .*.pem', replace: 'dh /etc/openvpn/dh.pem' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^ca ca.crt', replace: 'ca /etc/openvpn/ca.crt' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^cert server.crt', replace: 'cert /etc/openvpn/server.crt' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^key server.key', replace: 'key /etc/openvpn/server.key' }
+        
+        # TLS 및 인증 설정 보강
+        - replace:
+            path: /etc/openvpn/server.conf
+            regexp: '^tls-auth ta.key 0'
+            replace: "tls-auth ta.key 0\nkey-direction 0"
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^cipher AES-256-CBC', replace: "cipher AES-256-CBC\nauth SHA256" }
+
+        # 네트워크 게이트웨이 및 DNS 설정
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^;push "redirect-gateway def1 bypass-dhcp"', replace: 'push "redirect-gateway def1 bypass-dhcp"' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^;push "dhcp-option DNS 208.67.222.222"', replace: 'push "dhcp-option DNS 8.8.8.8"' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^;push "dhcp-option DNS 208.67.220.220"', replace: 'push "dhcp-option DNS 8.8.4.4"' }
+
+        # 기타 서비스 운영 설정
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^;client-to-client', replace: 'client-to-client' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^;duplicate-cn', replace: 'duplicate-cn' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^;user nobody', replace: 'user nobody' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^;group nobody', replace: 'group nogroup' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^port 1194', replace: 'port 3300' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^;proto tcp', replace: 'proto tcp' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^proto udp', replace: ';proto udp' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^explicit-exit-notify 1', replace: 'explicit-exit-notify 0' }
+
+    - name: 31. IP Forwarding 활성화
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        sysctl_set: yes
+        state: present
+        reload: yes
+
+    - name: 32. UFW before.rules에 NAT 룰 추가
+      blockinfile:
+        path: /etc/ufw/before.rules
+        insertbefore: BOF
+        marker: "# {mark} OPENVPN RULES"
+        block: |
+          *nat
+          :POSTROUTING ACCEPT [0:0]
+          -A POSTROUTING -s 10.8.0.0/8 -o {{ ansible_default_ipv4.interface }} -j MASQUERADE
+          COMMIT
+
+    - name: 33. UFW 기본 포워드 정책을 ACCEPT로 변경
+      lineinfile:
+        path: /etc/default/ufw
+        regexp: '^DEFAULT_FORWARD_POLICY='
+        line: 'DEFAULT_FORWARD_POLICY="ACCEPT"'
+
+    - name: 34. UFW 허용 규칙 추가 (3300/tcp, OpenSSH)
+      ufw:
+        rule: allow
+        port: "{{ item.port | default(omit) }}"
+        proto: "{{ item.proto | default(omit) }}"
+        name: "{{ item.name | default(omit) }}"
+      loop:
+        - { port: '3300', proto: 'tcp' }
+        - { name: 'OpenSSH' }
+
+    - name: 35. UFW 비활성화 후 활성화
+      shell: |
+        ufw --force disable
+        ufw --force enable
+
+    - name: 36 & 39. OpenVPN 서비스 시작 및 자동 실행 등록
+      systemd:
+        name: openvpn@server
+        state: restarted
+        enabled: yes
+
+    - name: 37. OpenVPN 서비스 상태 확인
+      command: systemctl status openvpn@server
+      register: ovpn_status
+      changed_when: false
+
+    - name: 38. tun0 어댑터 활성화 여부 확인
+      command: ip addr show tun0
+      register: tun0_info
+      changed_when: false
