@@ -1,0 +1,263 @@
+---
+- name: UFW 해외 IP 차단 설정 (ipset 기반)
+  hosts: all
+  become: yes
+  vars:
+    cloudflare_ipv4_url: "https://www.cloudflare.com/ips-v4"
+    korea_ip_url: "http://www.ipdeny.com/ipblocks/data/countries/kr.zone"
+    ipset_conf_path: "/etc/ipset.conf"
+    ufw_before_rules: "/etc/ufw/before.rules"
+    
+  tasks:
+    # 1단계: 패키지 설치
+    - name: 필요한 패키지 설치
+      apt:
+        name:
+          - ipset
+          - iptables-persistent
+          - curl
+        state: present
+        update_cache: yes
+
+    # 2단계: IP 대역 다운로드
+    - name: Cloudflare IPv4 대역 다운로드
+      get_url:
+        url: "{{ cloudflare_ipv4_url }}"
+        dest: /tmp/cloudflare-ipv4.txt
+        mode: '0644'
+
+    - name: 한국 IP 대역 다운로드
+      get_url:
+        url: "{{ korea_ip_url }}"
+        dest: /tmp/korea-ip.txt
+        mode: '0644'
+
+    # 3단계: 기존 ipset 확인 및 생성
+    - name: 기존 cloudflare ipset 확인
+      shell: ipset list cloudflare
+      register: cloudflare_exists
+      failed_when: false
+      changed_when: false
+
+    - name: cloudflare ipset 생성 (존재하지 않을 경우)
+      shell: ipset create cloudflare hash:net
+      when: cloudflare_exists.rc != 0
+
+    - name: cloudflare ipset flush
+      shell: ipset flush cloudflare
+
+    - name: Cloudflare IP 추가
+      shell: |
+        while read ip; do
+          ipset add cloudflare $ip 2>/dev/null || true
+        done < /tmp/cloudflare-ipv4.txt
+
+    - name: 기존 korea ipset 확인
+      shell: ipset list korea
+      register: korea_exists
+      failed_when: false
+      changed_when: false
+
+    - name: korea ipset 생성 (존재하지 않을 경우)
+      shell: ipset create korea hash:net
+      when: korea_exists.rc != 0
+
+    - name: korea ipset flush
+      shell: ipset flush korea
+
+    - name: 한국 IP 추가
+      shell: |
+        while read ip; do
+          ipset add korea $ip 2>/dev/null || true
+        done < /tmp/korea-ip.txt
+
+    # 4단계: ipset 저장
+    - name: ipset 설정 저장
+      shell: ipset save > {{ ipset_conf_path }}
+
+    # 5단계: UFW before.rules 백업
+    - name: UFW before.rules 백업
+      copy:
+        src: "{{ ufw_before_rules }}"
+        dest: "{{ ufw_before_rules }}.backup.{{ ansible_date_time.epoch }}"
+        remote_src: yes
+        mode: '0640'
+
+    # 6단계: filter 섹션만 수정
+    - name: UFW before.rules 읽기
+      slurp:
+        src: "{{ ufw_before_rules }}"
+      register: ufw_rules_content
+
+    - name: before.rules 파싱 및 filter 섹션 교체
+      set_fact:
+        ufw_rules_decoded: "{{ ufw_rules_content['content'] | b64decode }}"
+
+    - name: filter 섹션 이전 부분 추출
+      set_fact:
+        before_filter: "{{ ufw_rules_decoded.split('*filter')[0] if '*filter' in ufw_rules_decoded else '' }}"
+
+    - name: 새로운 filter 섹션 생성
+      set_fact:
+        new_filter_section: |
+          *filter
+          :ufw-before-input - [0:0]
+          :ufw-before-output - [0:0]
+          :ufw-before-forward - [0:0]
+          :ufw-not-local - [0:0]
+          # End required lines
+
+          # 로컬 루프백 허용
+          -A ufw-before-input -i lo -j ACCEPT
+          -A ufw-before-output -o lo -j ACCEPT
+
+          # ESTABLISHED 연결 허용
+          -A ufw-before-input -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+          -A ufw-before-output -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+          -A ufw-before-forward -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+          # INVALID 패킷 차단
+          -A ufw-before-input -m conntrack --ctstate INVALID -j ufw-logging-deny
+          -A ufw-before-input -m conntrack --ctstate INVALID -j DROP
+
+          # ipset 기반 국가 차단
+          # 한국 IP 모든 NEW 연결 허용
+          -A ufw-before-input -m conntrack --ctstate NEW -m set --match-set korea src -j ACCEPT
+
+          # Cloudflare HTTP/HTTPS 허용
+          -A ufw-before-input -m conntrack --ctstate NEW -p tcp -m multiport --dports 80,443 -m set --match-set cloudflare src -j ACCEPT
+
+          # 나머지 NEW 연결 차단
+          -A ufw-before-input -m conntrack --ctstate NEW -j DROP
+
+          # ICMP 허용
+          -A ufw-before-input -p icmp --icmp-type destination-unreachable -j ACCEPT
+          -A ufw-before-input -p icmp --icmp-type time-exceeded -j ACCEPT
+          -A ufw-before-input -p icmp --icmp-type parameter-problem -j ACCEPT
+          -A ufw-before-input -p icmp --icmp-type echo-request -j ACCEPT
+
+          # ICMP FORWARD 허용
+          -A ufw-before-forward -p icmp --icmp-type destination-unreachable -j ACCEPT
+          -A ufw-before-forward -p icmp --icmp-type time-exceeded -j ACCEPT
+          -A ufw-before-forward -p icmp --icmp-type parameter-problem -j ACCEPT
+          -A ufw-before-forward -p icmp --icmp-type echo-request -j ACCEPT
+
+          # DHCP 허용
+          -A ufw-before-input -p udp --sport 67 --dport 68 -j ACCEPT
+
+          # ufw-not-local 체인
+          -A ufw-before-input -j ufw-not-local
+          -A ufw-not-local -m addrtype --dst-type LOCAL -j RETURN
+          -A ufw-not-local -m addrtype --dst-type MULTICAST -j RETURN
+          -A ufw-not-local -m addrtype --dst-type BROADCAST -j RETURN
+          -A ufw-not-local -m limit --limit 3/min --limit-burst 10 -j ufw-logging-deny
+          -A ufw-not-local -j DROP
+
+          # mDNS 허용
+          -A ufw-before-input -p udp -d 224.0.0.251 --dport 5353 -j ACCEPT
+
+          # UPnP 허용
+          -A ufw-before-input -p udp -d 239.255.255.250 --dport 1900 -j ACCEPT
+
+          COMMIT
+
+    - name: 새로운 before.rules 파일 생성
+      copy:
+        content: "{{ before_filter }}{{ new_filter_section }}"
+        dest: "{{ ufw_before_rules }}"
+        mode: '0640'
+
+    # 7단계: UFW 재시작
+    - name: UFW 재시작
+      shell: ufw reload
+      register: ufw_reload_result
+
+    - name: UFW 재시작 결과 출력
+      debug:
+        msg: "{{ ufw_reload_result.stdout }}"
+
+    # 8단계: ipset 자동 로드 서비스 설정
+    - name: ipset-restore.service 파일 생성
+      copy:
+        dest: /etc/systemd/system/ipset-restore.service
+        content: |
+          [Unit]
+          Description=Restore ipset rules
+          Before=netfilter-persistent.service ufw.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/sbin/ipset restore -! -f {{ ipset_conf_path }}
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+
+    - name: systemd 데몬 리로드
+      systemd:
+        daemon_reload: yes
+
+    - name: ipset-restore 서비스 활성화 및 시작
+      systemd:
+        name: ipset-restore
+        enabled: yes
+        state: started
+
+    # 9단계: IP 리스트 자동 업데이트 스크립트
+    - name: IP 리스트 업데이트 스크립트 생성
+      copy:
+        dest: /usr/local/bin/update-ip-lists.sh
+        content: |
+          #!/bin/bash
+
+          # Cloudflare IP 업데이트
+          curl -s {{ cloudflare_ipv4_url }} -o /tmp/cloudflare-ipv4.txt
+
+          # 한국 IP 업데이트
+          curl -s {{ korea_ip_url }} -o /tmp/korea-ip.txt
+
+          # ipset 초기화 및 재생성
+          ipset flush cloudflare
+          while read ip; do
+              ipset add cloudflare $ip 2>/dev/null || true
+          done < /tmp/cloudflare-ipv4.txt
+
+          ipset flush korea
+          while read ip; do
+              ipset add korea $ip 2>/dev/null || true
+          done < /tmp/korea-ip.txt
+
+          # 설정 저장
+          ipset save > {{ ipset_conf_path }}
+
+          echo "IP lists updated: $(date)" >> /var/log/ip-update.log
+        mode: '0755'
+
+    - name: cron 작업 추가 (매주 일요일 새벽 3시)
+      cron:
+        name: "Update IP lists weekly"
+        minute: "0"
+        hour: "3"
+        weekday: "0"
+        job: "/usr/local/bin/update-ip-lists.sh"
+        user: root
+
+    # 10단계: 설정 확인
+    - name: ipset 항목 수 확인
+      shell: |
+        echo "Korea IPs: $(ipset list korea | grep 'Number of entries')"
+        echo "Cloudflare IPs: $(ipset list cloudflare | grep 'Number of entries')"
+      register: ipset_stats
+
+    - name: ipset 통계 출력
+      debug:
+        msg: "{{ ipset_stats.stdout_lines }}"
+
+    - name: UFW 규칙 확인
+      shell: iptables -L ufw-before-input -n -v --line-numbers | head -10
+      register: ufw_rules
+
+    - name: UFW 규칙 출력
+      debug:
+        msg: "{{ ufw_rules.stdout_lines }}"
