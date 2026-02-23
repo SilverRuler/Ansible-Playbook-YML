@@ -1,3 +1,4 @@
+#처음에 hosts.ini 접속할 대상에 먼저 ssh 접속해서 핑거프린트 뚫어놔야함
 # Ansible-Playbook-YML
 Ansible Playbook Collection
 
