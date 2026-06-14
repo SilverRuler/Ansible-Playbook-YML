@@ -2,7 +2,7 @@
 # Ansible-Playbook-YML
 Ansible Playbook Collection
 
-
+```
 앤서블 설치
 sudo apt update
 sudo apt install software-properties-common
@@ -21,3 +21,4 @@ ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i hosts.ini openvpn_setup.yml
 
 산출물은 
 root@aial-craft:~/client-configs/files# ls
+```
