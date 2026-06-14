@@ -29,7 +29,8 @@ vi /etc/openvpn/server.conf
 에서 10.8.0.을 10.8.1. 로
 ```
 
-``` OCI꺼 접속하는 순간 GCP 라우팅 우선순위 터짐
+```
+#OCI꺼 접속하는 순간 GCP 라우팅 우선순위 터짐
 # 1. 기존 설정 파일 백업
 sudo cp /etc/openvpn/client/sr-oci.conf /etc/openvpn/client/sr-oci.conf.bak
 
