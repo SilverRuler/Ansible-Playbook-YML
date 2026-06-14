@@ -22,3 +22,9 @@ ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i hosts.ini openvpn_setup.yml
 산출물은 
 root@aial-craft:~/client-configs/files# ls
 ```
+
+```
+대역대 바꾸기는 다 설치하고
+vi /etc/openvpn/server.conf
+에서 10.8.0.을 10.8.1. 로
+```
