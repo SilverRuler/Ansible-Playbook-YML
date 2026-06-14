@@ -10,6 +10,10 @@ sudo add-apt-repository --yes --update ppa:ansible/ansible
 sudo apt install ansible -y
 
 실행
+ansible-playbook -i hosts.ini openvpn_setup.yml
+이거 하는 도중에 최신 openvpn들이 자꾸 경로를 바꿔서 sameple-config-files 폴더에 내용이 없다하는데
+첨부파일 압축해제
+
 ansible-playbook -i hosts.ini openvpn_client.yml
 
 ANSIBLE_HOST_KEY_CHECKING=False ansible-playbook -i hosts.ini openvpn_setup.yml
