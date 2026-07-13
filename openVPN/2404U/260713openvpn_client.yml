@@ -1,0 +1,169 @@
+---
+# ============================================================
+# OpenVPN 클라이언트 설정 및 .ovpn 파일 생성 (Ubuntu 24.04 / Windows 호환)
+# 작성일: 2026-07-13
+# 기준: openvpn_client.yml (22.04 원본) + Windows 클라이언트 호환성 수정
+#
+# [Windows 클라이언트 호환 수정사항]
+#   1. user nobody / group nogroup 제거
+#      → Windows OpenVPN 클라이언트에서 "not implemented on Windows" 오류 발생
+#      → 서버(Linux)측 server.conf에만 유지, 클라이언트 .ovpn에서는 완전 제거
+#
+#   2. data-ciphers 제거
+#      → OpenVPN 2.5+ 문법이므로 Windows 2.4.x 클라이언트에서 인식 불가
+#      → "Unrecognized option or missing or extra parameter(s): data-ciphers" 오류
+#      → 클라이언트 .ovpn에는 cipher AES-256-CBC + auth SHA256 만 사용
+#      → 서버측 data-ciphers에 AES-256-CBC가 포함되어 있으므로 협상 정상 동작
+# ============================================================
+- name: OpenVPN 클라이언트 설정 및 .ovpn 파일 생성 (Ubuntu 24.04 / Windows 호환)
+  hosts: gcp_nodes
+  become: true
+  vars:
+    ansible_python_interpreter: auto
+    client_config_dir: "{{ ansible_env.HOME }}/client-configs"
+    client_name: "tongchun"
+
+  tasks:
+    - name: 1. 클라이언트 파일을 모을 폴더 생성
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0700'
+      loop:
+        - "{{ client_config_dir }}/files"
+        - "{{ client_config_dir }}/keys"
+
+    - name: 2. 샘플 client.conf 파일을 base.conf로 복사
+      copy:
+        src: /usr/share/doc/openvpn/examples/sample-config-files/client.conf
+        dest: "{{ client_config_dir }}/base.conf"
+        remote_src: yes
+        force: yes
+
+    - name: 3. GCP 외부 IP 주소 확인
+      shell: curl -s ifconfig.me
+      register: external_ip
+      changed_when: false
+
+    - name: 3-1. base.conf의 remote 설정을 외부 IP로 변경
+      replace:
+        path: "{{ client_config_dir }}/base.conf"
+        regexp: '^remote my-server-1 1194'
+        replace: "remote {{ external_ip.stdout }} 3300"
+
+    - name: 4. 프로토콜을 tcp로 변경
+      block:
+        - replace:
+            path: "{{ client_config_dir }}/base.conf"
+            regexp: '^;proto tcp'
+            replace: 'proto tcp'
+        - replace:
+            path: "{{ client_config_dir }}/base.conf"
+            regexp: '^proto udp'
+            replace: ';proto udp'
+
+    # [Windows 호환] user nobody / group nogroup 은 주석 처리 상태로 유지
+    # Windows OpenVPN 클라이언트는 이 옵션을 지원하지 않아 오류 발생
+    # 원본 client.conf 샘플에 ;user nobody / ;group nogroup 로 이미 주석 처리된 상태이므로
+    # 별도 처리 없이 그대로 둠 (원본 openvpn_client.yml의 5번 단계 제거)
+
+    - name: 5. SSL/TLS 인증서 설정 주석 처리
+      replace:
+        path: "{{ client_config_dir }}/base.conf"
+        regexp: '^(ca ca.crt|cert client.crt|key client.key)'
+        replace: '#\1'
+
+    # [Windows 호환] data-ciphers 는 OpenVPN 2.5+ 전용이므로 클라이언트 conf에서 제외
+    # cipher AES-256-CBC + auth SHA256 만 사용 → Windows 2.4.x 이상 모두 호환
+    - name: 6. Cipher(AES-256-CBC) 및 auth SHA256 추가
+      replace:
+        path: "{{ client_config_dir }}/base.conf"
+        regexp: '^cipher AES-256-CBC'
+        replace: "cipher AES-256-CBC\nauth SHA256"
+
+    - name: 7. key-direction 1 추가
+      lineinfile:
+        path: "{{ client_config_dir }}/base.conf"
+        insertafter: '^auth SHA256'
+        line: 'key-direction 1'
+
+    - name: 8. 리눅스용 스크립트 보안 설정 주석으로 추가 (Windows에서는 주석 그대로 둠)
+      lineinfile:
+        path: "{{ client_config_dir }}/base.conf"
+        line: "{{ item }}"
+      loop:
+        - "# script-security 2"
+        - "# up /etc/openvpn/update-resolv-conf"
+        - "# down /etc/openvpn/update-resolv-conf"
+
+    - name: 9-10. make_config.sh 스크립트 생성
+      copy:
+        dest: "{{ client_config_dir }}/make_config.sh"
+        content: |
+          #!/bin/bash
+          # First argument: Client identifier
+          KEY_DIR=~/client-configs/keys
+          OUTPUT_DIR=~/client-configs/files
+          BASE_CONFIG=~/client-configs/base.conf
+          cat ${BASE_CONFIG} \
+              <(echo -e '<ca>') \
+              ${KEY_DIR}/ca.crt \
+              <(echo -e '</ca>\n<cert>') \
+              ${KEY_DIR}/${1}.crt \
+              <(echo -e '</cert>\n<key>') \
+              ${KEY_DIR}/${1}.key \
+              <(echo -e '</key>\n<tls-auth>') \
+              ${KEY_DIR}/ta.key \
+              <(echo -e '</tls-auth>') \
+              > ${OUTPUT_DIR}/${1}.ovpn
+        mode: '0700'
+
+    - name: 11. make_config.sh 실행하여 {{ client_name }}.ovpn 생성
+      shell: "./make_config.sh {{ client_name }}"
+      args:
+        chdir: "{{ client_config_dir }}"
+        executable: /bin/bash
+
+    - name: 12. {{ client_name }}.ovpn 생성 확인
+      stat:
+        path: "{{ client_config_dir }}/files/{{ client_name }}.ovpn"
+      register: ovpn_file
+
+    - name: 12-1. 파일 생성 결과 출력
+      debug:
+        msg: "✅ 파일 생성 완료: {{ ovpn_file.stat.path }} ({{ ovpn_file.stat.size }} bytes)"
+      when: ovpn_file.stat.exists
+
+    - name: 13. ta.key 파일 복사 및 권한 설정
+      copy:
+        src: "{{ client_config_dir }}/keys/ta.key"
+        dest: "{{ client_config_dir }}/files/ta.key"
+        remote_src: yes
+        mode: '0644'
+
+    - name: 14. 클라이언트 배포용 tar.gz 생성 (원격 서버 /tmp)
+      shell: |
+        tar czf /tmp/vpn_{{ client_name }}_$(date +%Y%m%d).tar.gz \
+          -C {{ client_config_dir }}/files {{ client_name }}.ovpn \
+          -C {{ client_config_dir }}/keys ta.key
+      args:
+        executable: /bin/bash
+
+    - name: 15. tar.gz 파일 로컬로 fetch
+      fetch:
+        src: "/tmp/vpn_{{ client_name }}_{{ lookup('pipe', 'date +%Y%m%d') }}.tar.gz"
+        dest: "/root/vpn_{{ client_name }}_{{ lookup('pipe', 'date +%Y%m%d') }}.tar.gz"
+        flat: yes
+
+    - name: 16. 완료 메시지 출력
+      debug:
+        msg: |
+          ✅ 클라이언트 설정 완료 (Windows/Linux 모두 호환)
+          📁 원격: {{ client_config_dir }}/files/{{ client_name }}.ovpn
+          📁 원격: {{ client_config_dir }}/keys/ta.key
+          📦 로컬: /root/vpn_{{ client_name }}_{{ lookup('pipe', 'date +%Y%m%d') }}.tar.gz
+          
+          [적용된 Windows 호환 설정]
+          - user/group 옵션 제거 (Windows 미지원)
+          - data-ciphers 제거 (OpenVPN 2.4.x 미인식)
+          - cipher AES-256-CBC + auth SHA256 사용 (2.4.x 이상 전 버전 호환)
