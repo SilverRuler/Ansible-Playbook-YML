@@ -1,0 +1,241 @@
+---
+# ============================================================
+# OpenVPN 서버 자동 구축 플레이북 (Ubuntu 24.04 / OpenVPN 2.6+ 대응)
+# 작성일: 2026-07-13
+# 기준: openvpn_setup.yml (22.04 원본) + Ubuntu 24.04 호환성 패치
+#
+# [22.04 → 24.04 변경사항]
+#   - pre_tasks: 3300 포트 선점 프로세스 자동 중지
+#   - openvpn --genkey secret (2.6+ 정식 문법, 기존 --genkey --secret deprecated)
+#   - topology subnet 명시 (net30 deprecated 대응)
+#   - data-ciphers 서버측 추가 (2.6 WARNING 해소, 클라이언트 conf에는 미포함)
+#   - ansible_python_interpreter: auto (Python 3.12 타겟 WARNING 제거)
+#
+# [Windows 클라이언트 호환 관련 - 서버측 설정]
+#   - server.conf의 user nobody / group nogroup 은 Linux 서버 전용 → 유지
+#   - 클라이언트 .ovpn에서는 user/group 제거 (260713openvpn_client.yml 참조)
+# ============================================================
+- name: OpenVPN 및 Easy-RSA 전체 환경 구축 및 서비스 가동 (Ubuntu 24.04)
+  hosts: gcp_nodes
+  become: true
+  vars:
+    ansible_python_interpreter: auto
+    easyrsa_version: "3.0.4"
+    easyrsa_dir: "{{ ansible_env.HOME }}/EasyRSA-{{ easyrsa_version }}"
+    easyrsa_url: "https://github.com/OpenVPN/easy-rsa/releases/download/v{{ easyrsa_version }}/EasyRSA-{{ easyrsa_version }}.tgz"
+    ovpn_dir: "/etc/openvpn"
+    vpn_port: "3300"
+
+  pre_tasks:
+    - name: PRE. 3300 포트 선점 프로세스 중지 (3proxy 등)
+      # Ubuntu 24.04 환경에서는 3proxy 등이 3300 포트를 사용 중일 수 있음
+      # OpenVPN 포트 바인딩 실패(Address already in use) 방지
+      shell: |
+        PID=$(ss -tulpn | grep ':{{ vpn_port }}' | grep -oP 'pid=\K[0-9]+' | head -1)
+        if [ -n "$PID" ]; then
+          PROC=$(ps -p $PID -o comm= 2>/dev/null || echo unknown)
+          systemctl stop $PROC 2>/dev/null || kill $PID 2>/dev/null
+          echo "Stopped PID $PID ($PROC) on port {{ vpn_port }}"
+        else
+          echo "Port {{ vpn_port }} is free"
+        fi
+      changed_when: false
+
+  tasks:
+    - name: 1. apt 업데이트 및 openvpn 설치
+      apt:
+        name: openvpn
+        update_cache: yes
+        state: present
+
+    - name: 2. Easy-RSA 다운로드 및 압축 해제
+      unarchive:
+        src: "{{ easyrsa_url }}"
+        dest: "{{ ansible_env.HOME }}"
+        remote_src: yes
+        creates: "{{ easyrsa_dir }}"
+
+    - name: 3. Easy-RSA 설정 파일(vars) 정보 수정
+      block:
+        - name: vars.example 파일을 vars로 복사
+          copy:
+            src: "{{ easyrsa_dir }}/vars.example"
+            dest: "{{ easyrsa_dir }}/vars"
+            remote_src: yes
+            force: no
+        - name: vars 파일 내 지역 및 조직 정보 수정
+          lineinfile:
+            path: "{{ easyrsa_dir }}/vars"
+            regexp: '^#?set_var {{ item.key }}'
+            line: 'set_var {{ item.key }}    "{{ item.value }}"'
+          loop:
+            - { key: 'EASYRSA_REQ_COUNTRY', value: 'KR' }
+            - { key: 'EASYRSA_REQ_PROVINCE', value: 'Gyeonggi-do' }
+            - { key: 'EASYRSA_REQ_CITY', value: 'Seongnam' }
+            - { key: 'EASYRSA_REQ_ORG', value: 'nSR' }
+            - { key: 'EASYRSA_REQ_EMAIL', value: 'SR@sr.co.kr' }
+            - { key: 'EASYRSA_REQ_OU', value: 'SR' }
+
+    - name: 4-6. PKI 초기화 및 CA/서버 인증서 생성
+      block:
+        - command: "./easyrsa init-pki"
+          args: { chdir: "{{ easyrsa_dir }}", creates: "{{ easyrsa_dir }}/pki" }
+        - command: "./easyrsa build-ca nopass"
+          args: { chdir: "{{ easyrsa_dir }}", creates: "{{ easyrsa_dir }}/pki/ca.crt" }
+          environment: { EASYRSA_BATCH: "1", EASYRSA_REQ_CN: "OpenVPN-CA" }
+        - command: "./easyrsa gen-req server nopass"
+          args: { chdir: "{{ easyrsa_dir }}", creates: "{{ easyrsa_dir }}/pki/private/server.key" }
+          environment: { EASYRSA_BATCH: "1", EASYRSA_REQ_CN: "vpn-server" }
+
+    - name: 8-12. 서버 인증서 사인 및 DH, ta.key 생성/복사
+      block:
+        - command: "./easyrsa sign-req server server"
+          args: { chdir: "{{ easyrsa_dir }}", creates: "{{ easyrsa_dir }}/pki/issued/server.crt" }
+          environment: { EASYRSA_BATCH: "1" }
+        - copy:
+            src: "{{ item.src }}"
+            dest: "{{ item.dest }}"
+            remote_src: yes
+          loop:
+            - { src: "{{ easyrsa_dir }}/pki/issued/server.crt", dest: "{{ ovpn_dir }}/server.crt" }
+            - { src: "{{ easyrsa_dir }}/pki/ca.crt", dest: "{{ ovpn_dir }}/ca.crt" }
+            - { src: "{{ easyrsa_dir }}/pki/private/server.key", dest: "{{ ovpn_dir }}/server.key" }
+        - command: "./easyrsa gen-dh"
+          args: { chdir: "{{ easyrsa_dir }}", creates: "{{ easyrsa_dir }}/pki/dh.pem" }
+          environment: { EASYRSA_BATCH: "1" }
+        - copy: { src: "{{ easyrsa_dir }}/pki/dh.pem", dest: "{{ ovpn_dir }}/dh.pem", remote_src: yes }
+        # [24.04 변경] OpenVPN 2.6+: --genkey --secret 는 deprecated → --genkey secret 사용
+        - command: "openvpn --genkey secret {{ ovpn_dir }}/ta.key"
+          args: { creates: "{{ ovpn_dir }}/ta.key" }
+
+    - name: 15-20. 클라이언트(tongchun) 인증서 생성 및 정리
+      block:
+        - file: { path: "{{ ansible_env.HOME }}/client-configs/keys", state: directory, mode: '0700' }
+        - command: "./easyrsa gen-req tongchun nopass"
+          args: { chdir: "{{ easyrsa_dir }}", creates: "{{ easyrsa_dir }}/pki/private/tongchun.key" }
+          environment: { EASYRSA_BATCH: "1", EASYRSA_REQ_CN: "tongchun" }
+        - command: "./easyrsa sign-req client tongchun"
+          args: { chdir: "{{ easyrsa_dir }}", creates: "{{ easyrsa_dir }}/pki/issued/tongchun.crt" }
+          environment: { EASYRSA_BATCH: "1" }
+        - copy:
+            src: "{{ item.src }}"
+            dest: "{{ item.dest }}"
+            remote_src: yes
+          loop:
+            - { src: "{{ easyrsa_dir }}/pki/private/tongchun.key", dest: "{{ ansible_env.HOME }}/client-configs/keys/tongchun.key" }
+            - { src: "{{ easyrsa_dir }}/pki/issued/tongchun.crt", dest: "{{ ansible_env.HOME }}/client-configs/keys/tongchun.crt" }
+            - { src: "{{ ovpn_dir }}/ca.crt", dest: "{{ ansible_env.HOME }}/client-configs/keys/ca.crt" }
+            - { src: "{{ ovpn_dir }}/ta.key", dest: "{{ ansible_env.HOME }}/client-configs/keys/ta.key" }
+
+    - name: 21. server.conf 설정 적용 (Redirect Gateway, DNS Leak 방지 포함)
+      block:
+        - copy: { src: /usr/share/doc/openvpn/examples/sample-config-files/server.conf, dest: /etc/openvpn/server.conf, remote_src: yes, force: yes }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^dh .*.pem', replace: 'dh /etc/openvpn/dh.pem' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^ca ca.crt', replace: 'ca /etc/openvpn/ca.crt' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^cert server.crt', replace: 'cert /etc/openvpn/server.crt' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^key server.key', replace: 'key /etc/openvpn/server.key' }
+
+        # [24.04 추가] topology subnet: net30은 향후 지원 종료 예정
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^;topology subnet', replace: 'topology subnet' }
+
+        # TLS 및 인증 설정 보강
+        - replace:
+            path: /etc/openvpn/server.conf
+            regexp: '^tls-auth ta.key 0'
+            replace: "tls-auth ta.key 0\nkey-direction 0"
+
+        # [24.04 추가] 서버측 data-ciphers: OpenVPN 2.6 서버의 cipher WARNING 해소
+        # AES-256-CBC를 포함시켜 Windows 2.4.x 클라이언트와 협상 가능하게 유지
+        - replace:
+            path: /etc/openvpn/server.conf
+            regexp: '^cipher AES-256-CBC'
+            replace: "data-ciphers AES-256-GCM:AES-256-CBC\ncipher AES-256-CBC\nauth SHA256"
+
+        # 네트워크 게이트웨이 및 DNS 설정 (DNS Leak 방지 핵심)
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^;push "redirect-gateway def1 bypass-dhcp"', replace: 'push "redirect-gateway def1 bypass-dhcp"' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^;push "dhcp-option DNS 208.67.222.222"', replace: 'push "dhcp-option DNS 8.8.8.8"' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^;push "dhcp-option DNS 208.67.220.220"', replace: 'push "dhcp-option DNS 8.8.4.4"' }
+
+        # Windows DNS Leak 방지 및 IPv6 트래픽 누수 방지
+        - blockinfile:
+            path: /etc/openvpn/server.conf
+            insertafter: '^push "dhcp-option DNS 8.8.4.4"'
+            marker: "# {mark} ANTI DNS LEAK RULES"
+            block: |
+              push "block-outside-dns"
+              push "route-ipv6 2000::/3"
+              push "redirect-gateway ipv6"
+
+        # 기타 서비스 운영 설정
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^;client-to-client', replace: 'client-to-client' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^;duplicate-cn', replace: 'duplicate-cn' }
+        # user/group: 서버(Linux)측 설정이므로 유지 - 클라이언트 .ovpn에는 포함하지 않음
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^;user nobody', replace: 'user nobody' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^;group nobody', replace: 'group nogroup' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^port 1194', replace: 'port {{ vpn_port }}' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^;proto tcp', replace: 'proto tcp' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^proto udp', replace: ';proto udp' }
+        - replace: { path: /etc/openvpn/server.conf, regexp: '^explicit-exit-notify 1', replace: 'explicit-exit-notify 0' }
+
+    - name: 31. IP Forwarding 활성화
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        sysctl_set: yes
+        state: present
+        reload: yes
+
+    - name: 32. UFW before.rules에 NAT 룰 추가
+      blockinfile:
+        path: /etc/ufw/before.rules
+        insertbefore: BOF
+        marker: "# {mark} OPENVPN RULES"
+        block: |
+          *nat
+          :POSTROUTING ACCEPT [0:0]
+          -A POSTROUTING -s 10.8.0.0/8 -o {{ ansible_default_ipv4.interface }} -j MASQUERADE
+          COMMIT
+
+    - name: 33. UFW 기본 포워드 정책을 ACCEPT로 변경
+      lineinfile:
+        path: /etc/default/ufw
+        regexp: '^DEFAULT_FORWARD_POLICY='
+        line: 'DEFAULT_FORWARD_POLICY="ACCEPT"'
+
+    - name: 34. UFW 허용 규칙 추가 ({{ vpn_port }}/tcp, OpenSSH)
+      ufw:
+        rule: allow
+        port: "{{ item.port | default(omit) }}"
+        proto: "{{ item.proto | default(omit) }}"
+        name: "{{ item.name | default(omit) }}"
+      loop:
+        - { port: '{{ vpn_port }}', proto: 'tcp' }
+        - { name: 'OpenSSH' }
+
+    - name: 35. UFW 비활성화 후 활성화
+      shell: |
+        ufw --force disable
+        ufw --force enable
+
+    - name: 36 & 39. OpenVPN 서비스 시작 및 자동 실행 등록 (재부팅 후 자동 시작)
+      systemd:
+        name: openvpn@server
+        state: restarted
+        enabled: yes
+
+    - name: 37. OpenVPN 서비스 상태 확인
+      command: systemctl status openvpn@server
+      register: ovpn_status
+      changed_when: false
+
+    - name: 38. tun0 어댑터 활성화 여부 확인
+      command: ip addr show tun0
+      register: tun0_info
+      changed_when: false
+
+    - name: 39. 자동시작 등록 확인 출력
+      debug:
+        msg: |
+          ✅ OpenVPN 서비스 상태: {{ 'active' if 'active (running)' in ovpn_status.stdout else 'inactive' }}
+          ✅ 재부팅 자동시작: enabled
+          ✅ tun0 인터페이스: {{ 'UP' if 'tun0' in tun0_info.stdout else 'NOT FOUND' }}
